@@ -270,7 +270,7 @@ export default {
   'log-section': 'Log Aplikasi',
   'log-path': 'File Log',
   'clear-log': 'Hapus Log',
-  'clear-log-confirm': 'Apakah Anda yakin ingin menghapus isi file log?',
+  'clear-log-confirm': 'Hapus log saat ini dan historis?',
   'clear-log-success': 'Log dihapus',
   'clear-log-failed': 'Gagal menghapus log',
   'history-section': 'Riwayat Unduhan',

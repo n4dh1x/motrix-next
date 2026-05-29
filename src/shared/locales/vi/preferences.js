@@ -267,7 +267,7 @@ export default {
   'log-section': 'Nhật ký',
   'log-path': 'Tập tin nhật ký',
   'clear-log': 'Xóa nhật ký',
-  'clear-log-confirm': 'Bạn có chắc chắn muốn xóa nội dung tập tin nhật ký?',
+  'clear-log-confirm': 'Xóa nhật ký hiện tại và cũ?',
   'clear-log-success': 'Đã xóa nhật ký',
   'clear-log-failed': 'Xóa nhật ký thất bại',
   'history-section': 'Lịch sử tải xuống',

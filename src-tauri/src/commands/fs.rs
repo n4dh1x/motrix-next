@@ -4,22 +4,53 @@ use std::path::Path;
 use tauri::AppHandle;
 use tauri::Manager;
 
-fn is_motrix_log_file(name: &str) -> bool {
-    name == "motrix-next.log" || name.starts_with("motrix-next.log.")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedLogFileKind {
+    Active,
+    Rotated,
 }
 
-fn is_aria2_log_file(name: &str) -> bool {
-    (name == "aria2-next.log") || (name.starts_with("aria2-next.") && name.ends_with(".log"))
+fn is_aria2_rotated_log_file(name: &str) -> bool {
+    let Some(index) = name
+        .strip_prefix("aria2-next.")
+        .and_then(|rest| rest.strip_suffix(".log"))
+    else {
+        return false;
+    };
+    !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn managed_log_file_kind(name: &str) -> Option<ManagedLogFileKind> {
+    if name == "motrix-next.log" || name == "aria2-next.log" {
+        Some(ManagedLogFileKind::Active)
+    } else if is_aria2_rotated_log_file(name) {
+        Some(ManagedLogFileKind::Rotated)
+    } else {
+        None
+    }
 }
 
 fn diagnostic_log_zip_path(name: &str, aria2_logs_enabled: bool) -> Option<String> {
-    if is_motrix_log_file(name) {
+    if name == "motrix-next.log" {
         Some(format!("motrix-next/{name}"))
-    } else if aria2_logs_enabled && is_aria2_log_file(name) {
+    } else if aria2_logs_enabled && (name == "aria2-next.log" || is_aria2_rotated_log_file(name)) {
         Some(format!("aria2-next/{name}"))
     } else {
         None
     }
+}
+
+fn should_export_log_file(
+    path: &Path,
+    name: &str,
+    aria2_logs_enabled: bool,
+) -> Result<bool, AppError> {
+    let Some(_) = diagnostic_log_zip_path(name, aria2_logs_enabled) else {
+        return Ok(false);
+    };
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| AppError::Io(format!("Failed to read log metadata: {e}")))?;
+    Ok(metadata.len() > 0)
 }
 
 fn config_aria2_logs_enabled(raw: &Value) -> bool {
@@ -119,13 +150,7 @@ pub fn is_autostart_launch(lifecycle: tauri::State<'_, crate::AppLifecycleState>
     result
 }
 
-/// Truncates managed log files in the app log directory.
-#[tauri::command]
-pub fn clear_log_file(app: AppHandle) -> Result<(), AppError> {
-    let log_dir = app
-        .path()
-        .app_log_dir()
-        .map_err(|e| AppError::Io(e.to_string()))?;
+fn clear_managed_log_files_in_dir(log_dir: &Path) -> Result<(), AppError> {
     if !log_dir.exists() {
         return Ok(());
     }
@@ -138,13 +163,35 @@ pub fn clear_log_file(app: AppHandle) -> Result<(), AppError> {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("");
-        if path.is_file() && (is_motrix_log_file(name) || is_aria2_log_file(name)) {
-            std::fs::write(&path, "")
-                .map_err(|e| AppError::Io(format!("Failed to clear log: {e}")))?;
-            log::info!("log file cleared: {}", path.display());
+        if !path.is_file() {
+            continue;
+        }
+        match managed_log_file_kind(name) {
+            Some(ManagedLogFileKind::Active) => {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&path)
+                    .map_err(|e| AppError::Io(format!("Failed to clear active log: {e}")))?;
+            }
+            Some(ManagedLogFileKind::Rotated) => {
+                std::fs::remove_file(&path)
+                    .map_err(|e| AppError::Io(format!("Failed to remove rotated log: {e}")))?;
+            }
+            None => {}
         }
     }
     Ok(())
+}
+
+/// Clears managed logs in the app log directory.
+#[tauri::command]
+pub fn clear_log_file(app: AppHandle) -> Result<(), AppError> {
+    let log_dir = app
+        .path()
+        .app_log_dir()
+        .map_err(|e| AppError::Io(e.to_string()))?;
+    clear_managed_log_files_in_dir(&log_dir)
 }
 
 /// Collects all log files from the app log directory and compresses them
@@ -245,6 +292,9 @@ pub async fn export_diagnostic_logs(app: AppHandle, save_path: String) -> Result
             let Some(zip_name) = diagnostic_log_zip_path(&name, aria2_logs_enabled) else {
                 continue;
             };
+            if !should_export_log_file(&path, &name, aria2_logs_enabled)? {
+                continue;
+            }
             let content = std::fs::read(&path)
                 .map_err(|e| AppError::Io(format!("Failed to read {}: {}", name, e)))?;
             zip_writer
@@ -332,10 +382,6 @@ mod export_tests {
             Some("motrix-next/motrix-next.log".to_string())
         );
         assert_eq!(
-            diagnostic_log_zip_path("motrix-next.log.1", true),
-            Some("motrix-next/motrix-next.log.1".to_string())
-        );
-        assert_eq!(
             diagnostic_log_zip_path("aria2-next.log", true),
             Some("aria2-next/aria2-next.log".to_string())
         );
@@ -345,6 +391,7 @@ mod export_tests {
         );
         assert_eq!(diagnostic_log_zip_path("other.log", true), None);
         assert_eq!(diagnostic_log_zip_path("aria2-next.log.1", true), None);
+        assert_eq!(diagnostic_log_zip_path("motrix-next.log.1", true), None);
     }
 
     #[test]
@@ -355,6 +402,80 @@ mod export_tests {
         );
         assert_eq!(diagnostic_log_zip_path("aria2-next.log", false), None);
         assert_eq!(diagnostic_log_zip_path("aria2-next.1.log", false), None);
+    }
+
+    #[test]
+    fn managed_log_file_kind_classifies_current_log_names_only() {
+        assert_eq!(
+            managed_log_file_kind("motrix-next.log"),
+            Some(ManagedLogFileKind::Active)
+        );
+        assert_eq!(
+            managed_log_file_kind("aria2-next.log"),
+            Some(ManagedLogFileKind::Active)
+        );
+        assert_eq!(
+            managed_log_file_kind("aria2-next.1.log"),
+            Some(ManagedLogFileKind::Rotated)
+        );
+        assert_eq!(
+            managed_log_file_kind("aria2-next.20.log"),
+            Some(ManagedLogFileKind::Rotated)
+        );
+        assert_eq!(managed_log_file_kind("aria2-next.log.1"), None);
+        assert_eq!(managed_log_file_kind("motrix-next.log.1"), None);
+        assert_eq!(managed_log_file_kind("other.log"), None);
+    }
+
+    #[test]
+    fn clear_managed_log_files_truncates_active_logs_and_removes_rotated_logs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let motrix = dir.path().join("motrix-next.log");
+        let aria2 = dir.path().join("aria2-next.log");
+        let rotated = dir.path().join("aria2-next.1.log");
+        let legacy = dir.path().join("aria2-next.log.1");
+        let other = dir.path().join("other.log");
+
+        std::fs::write(&motrix, "motrix log").expect("motrix log");
+        std::fs::write(&aria2, "aria2 log").expect("aria2 log");
+        std::fs::write(&rotated, "rotated log").expect("rotated log");
+        std::fs::write(&legacy, "legacy log").expect("legacy log");
+        std::fs::write(&other, "other log").expect("other log");
+
+        clear_managed_log_files_in_dir(dir.path()).expect("clear logs");
+
+        assert_eq!(
+            std::fs::metadata(&motrix).expect("motrix metadata").len(),
+            0
+        );
+        assert_eq!(std::fs::metadata(&aria2).expect("aria2 metadata").len(), 0);
+        assert!(!rotated.exists());
+        assert_eq!(
+            std::fs::read_to_string(&legacy).expect("legacy content"),
+            "legacy log"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&other).expect("other content"),
+            "other log"
+        );
+    }
+
+    #[test]
+    fn should_export_log_file_skips_empty_logs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let empty = dir.path().join("aria2-next.log");
+        let non_empty = dir.path().join("motrix-next.log");
+        let other = dir.path().join("other.log");
+
+        std::fs::write(&empty, "").expect("empty log");
+        std::fs::write(&non_empty, "log").expect("non-empty log");
+        std::fs::write(&other, "log").expect("other log");
+
+        assert!(!should_export_log_file(&empty, "aria2-next.log", true).expect("empty export"));
+        assert!(
+            should_export_log_file(&non_empty, "motrix-next.log", true).expect("non-empty export")
+        );
+        assert!(!should_export_log_file(&other, "other.log", true).expect("other export"));
     }
 
     #[test]
