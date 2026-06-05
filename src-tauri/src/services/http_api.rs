@@ -40,7 +40,7 @@ use tower_http::cors::CorsLayer;
 // ── Request / Response Types ────────────────────────────────────────
 
 /// Headers map for HLS/DASH media streams.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct StreamHeaderMap {
     #[serde(rename = "User-Agent")]
     pub user_agent: Option<String>,
@@ -51,7 +51,7 @@ pub struct StreamHeaderMap {
 }
 
 /// POST /v1/stream-task request body from the browser sniffer.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct StreamTaskRequest {
     pub url: String,
     pub title: String,
@@ -249,7 +249,7 @@ async fn handle_stream_task(
 
     let app_handle = ctx.app.clone();
     tokio::spawn(async move {
-        if let Err(e) = crate::services::stream_downloader::execute_stream_download(app_handle, body).await {
+        if let Err(e) = crate::services::stream_downloader::execute_stream_download(app_handle, None, body).await {
             log::error!("http_api: stream download failed: {e}");
         }
     });

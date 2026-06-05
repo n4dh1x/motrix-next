@@ -5,12 +5,20 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 use tauri::{AppHandle, Manager, Emitter};
 use tauri_plugin_shell::ShellExt;
 use serde::Serialize;
-use crate::services::http_api::StreamTaskRequest;
+use crate::services::http_api::{StreamTaskRequest, StreamHeaderMap};
 
 static TASK_COUNTER: AtomicUsize = AtomicUsize::new(1);
+static RUNNING_PROCESSES: OnceLock<Mutex<HashMap<String, tauri_plugin_shell::process::CommandChild>>> = OnceLock::new();
+
+fn get_running_processes() -> &'static Mutex<HashMap<String, tauri_plugin_shell::process::CommandChild>> {
+    RUNNING_PROCESSES.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 #[derive(Serialize, Clone)]
 struct ProgressPayload {
@@ -103,9 +111,15 @@ async fn prepare_ffmpeg_binary(app_handle: &AppHandle) -> Result<PathBuf, String
     Ok(bin_dir)
 }
 
-pub async fn execute_stream_download(app_handle: AppHandle, task: StreamTaskRequest) -> Result<(), String> {
-    let index = TASK_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let task_id = format!("stream-{}", index);
+pub async fn execute_stream_download(
+    app_handle: AppHandle,
+    task_id: Option<String>,
+    task: StreamTaskRequest,
+) -> Result<(), String> {
+    let task_id = task_id.unwrap_or_else(|| {
+        let index = TASK_COUNTER.fetch_add(1, Ordering::SeqCst);
+        format!("stream-{}", index)
+    });
     
     // Resolve output target directory (Downloads)
     let download_dir = app_handle
@@ -145,16 +159,16 @@ pub async fn execute_stream_download(app_handle: AppHandle, task: StreamTaskRequ
     ];
 
     // Inject headers passed down from extension to authorize requests
-    if let Some(headers) = task.headers {
-        if let Some(ua) = headers.user_agent {
+    if let Some(ref headers) = task.headers {
+        if let Some(ref ua) = headers.user_agent {
             args.push("--user-agent".to_string());
-            args.push(ua);
+            args.push(ua.clone());
         }
-        if let Some(ref_url) = headers.referer {
+        if let Some(ref ref_url) = headers.referer {
             args.push("--referer".to_string());
-            args.push(ref_url);
+            args.push(ref_url.clone());
         }
-        if let Some(cookie) = headers.cookie {
+        if let Some(ref cookie) = headers.cookie {
             args.push("--add-header".to_string());
             args.push(format!("Cookie:{}", cookie));
         }
@@ -162,12 +176,14 @@ pub async fn execute_stream_download(app_handle: AppHandle, task: StreamTaskRequ
 
     args.push(task.url.clone());
 
-    // Emit initialization info
+    // Emit initialization info (including URL and headers so frontend store can persist it)
     let _ = app_handle.emit("stream-added", serde_json::json!({
         "id": task_id,
         "title": task.title,
         "quality": task.quality,
-        "status": "Starting"
+        "status": "Starting",
+        "url": task.url,
+        "headers": task.headers
     }));
 
     log::info!("stream_downloader: Spawning yt-dlp sidecar for task {}", task_id);
@@ -179,7 +195,10 @@ pub async fn execute_stream_download(app_handle: AppHandle, task: StreamTaskRequ
         .map_err(|e| e.to_string())?
         .args(args);
 
-    let (mut rx, mut _child) = command.spawn().map_err(|e| e.to_string())?;
+    let (mut rx, child) = command.spawn().map_err(|e| e.to_string())?;
+
+    // Insert child handle into running processes
+    get_running_processes().lock().unwrap().insert(task_id.clone(), child);
 
     while let Some(event) = rx.recv().await {
         if let tauri_plugin_shell::process::CommandEvent::Stdout(line_bytes) = event {
@@ -203,7 +222,7 @@ pub async fn execute_stream_download(app_handle: AppHandle, task: StreamTaskRequ
                         "--:--".to_string()
                     };
 
-                    let _ = app_handle.emit(&format!("progress-{}", task_id), ProgressPayload {
+                    let _ = app_handle.emit("stream-progress", ProgressPayload {
                         task_id: task_id.clone(),
                         percent,
                         speed,
@@ -218,11 +237,103 @@ pub async fn execute_stream_download(app_handle: AppHandle, task: StreamTaskRequ
         }
     }
 
-    log::info!("stream_downloader: Task {} completed, output file: {}", task_id, output_file_str);
-    let _ = app_handle.emit(&format!("status-{}", task_id), StatusPayload {
-        task_id,
-        status: "Completed".to_string(),
-        output_path: output_file_str,
+    // After loop, check if it was paused/deleted or completed
+    let mut processes = get_running_processes().lock().unwrap();
+    if processes.remove(&task_id).is_some() {
+        // It finished on its own (was not removed by pause/delete commands)
+        let success = std::path::Path::new(&output_file_str).exists();
+        if success {
+            log::info!("stream_downloader: Task {} completed, output file: {}", task_id, output_file_str);
+            let _ = app_handle.emit("stream-status", StatusPayload {
+                task_id,
+                status: "Completed".to_string(),
+                output_path: output_file_str,
+            });
+        } else {
+            log::error!("stream_downloader: Task {} failed", task_id);
+            let _ = app_handle.emit("stream-status", StatusPayload {
+                task_id,
+                status: "Error".to_string(),
+                output_path: String::new(),
+            });
+        }
+    }
+    Ok(())
+}
+
+pub async fn pause_stream_download(task_id: String) -> Result<(), String> {
+    let mut processes = get_running_processes().lock().unwrap();
+    if let Some(child) = processes.remove(&task_id) {
+        let _ = child.kill();
+        log::info!("stream_downloader: Task {} paused (killed process)", task_id);
+        Ok(())
+    } else {
+        Err("Task is not active or already paused".to_string())
+    }
+}
+
+pub async fn resume_stream_download(
+    app_handle: AppHandle,
+    task_id: String,
+    url: String,
+    title: String,
+    quality: String,
+    headers: Option<StreamHeaderMap>,
+) -> Result<(), String> {
+    let task = StreamTaskRequest {
+        url,
+        title,
+        quality,
+        headers,
+    };
+    // Re-execute with the same task ID
+    tokio::spawn(async move {
+        if let Err(e) = execute_stream_download(app_handle, Some(task_id), task).await {
+            log::error!("stream_downloader: Failed to resume task: {e}");
+        }
     });
+    Ok(())
+}
+
+pub async fn delete_stream_download(
+    task_id: String,
+    delete_file: bool,
+    output_path: Option<String>,
+) -> Result<(), String> {
+    // 1. Kill the process if running
+    let mut processes = get_running_processes().lock().unwrap();
+    if let Some(child) = processes.remove(&task_id) {
+        let _ = child.kill();
+        log::info!("stream_downloader: Killed active task {} for deletion", task_id);
+    }
+
+    // 2. Delete output files if requested
+    if delete_file {
+        if let Some(path_str) = output_path {
+            if !path_str.is_empty() {
+                let path = std::path::Path::new(&path_str);
+                if path.exists() {
+                    let _ = std::fs::remove_file(path);
+                    log::info!("stream_downloader: Deleted output file: {}", path_str);
+                }
+                
+                // Also check and delete .part file if exists
+                let part_path_str = format!("{}.part", path_str);
+                let part_path = std::path::Path::new(&part_path_str);
+                if part_path.exists() {
+                    let _ = std::fs::remove_file(part_path);
+                    log::info!("stream_downloader: Deleted partial file: {}", part_path_str);
+                }
+                
+                // Also check and delete .ytdl file if exists
+                let ytdl_path_str = format!("{}.ytdl", path_str);
+                let ytdl_path = std::path::Path::new(&ytdl_path_str);
+                if ytdl_path.exists() {
+                    let _ = std::fs::remove_file(ytdl_path);
+                    log::info!("stream_downloader: Deleted ytdl temp file: {}", ytdl_path_str);
+                }
+            }
+        }
+    }
     Ok(())
 }

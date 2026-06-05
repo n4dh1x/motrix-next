@@ -8,6 +8,7 @@ import { usePreferenceStore } from './stores/preference'
 import { useTaskStore } from './stores/task'
 import { useAppStore } from './stores/app'
 import { useHistoryStore } from './stores/history'
+import { useStreamStore } from './stores/stream'
 import aria2Api from './api/aria2'
 import {
   BT_LISTEN_PORT,
@@ -343,6 +344,11 @@ if (import.meta.env.PROD) {
     // Flush deferred migration toasts now that i18n locale is active.
     // loadPreference() buffers these signals to avoid showing English toasts.
     preferenceStore.flushMigrationSignals()
+
+    // Hydrate stream downloads store and register global progress/status listeners
+    const streamStore = useStreamStore()
+    await streamStore.loadTasks()
+    streamStore.initListeners()
 
     // Mount only after preference + locale hydration so root-level theme,
     // color-scheme, locale, and layout watchers see stable persisted values
