@@ -39,6 +39,26 @@ use tower_http::cors::CorsLayer;
 
 // ── Request / Response Types ────────────────────────────────────────
 
+/// Headers map for HLS/DASH media streams.
+#[derive(Debug, Deserialize)]
+pub struct StreamHeaderMap {
+    #[serde(rename = "User-Agent")]
+    pub user_agent: Option<String>,
+    #[serde(rename = "Referer")]
+    pub referer: Option<String>,
+    #[serde(rename = "Cookie")]
+    pub cookie: Option<String>,
+}
+
+/// POST /v1/stream-task request body from the browser sniffer.
+#[derive(Debug, Deserialize)]
+pub struct StreamTaskRequest {
+    pub url: String,
+    pub title: String,
+    pub quality: String,
+    pub headers: Option<StreamHeaderMap>,
+}
+
 /// POST /add request body from the browser extension.
 #[derive(Debug, Deserialize)]
 pub struct AddRequest {
@@ -159,6 +179,7 @@ pub fn build_router(ctx: Arc<ApiContext>) -> Router {
     Router::new()
         .route("/ping", get(handle_ping))
         .route("/add", post(handle_add))
+        .route("/v1/stream-task", post(handle_stream_task))
         .route("/version", get(handle_version))
         .route("/stat", get(handle_stat))
         .route("/pause-all", post(handle_pause_all))
@@ -216,6 +237,24 @@ async fn handle_add(
         gid: None,
         message: None,
     }))
+}
+
+async fn handle_stream_task(
+    State(ctx): State<Arc<ApiContext>>,
+    headers: HeaderMap,
+    Json(body): Json<StreamTaskRequest>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let secret = read_api_secret(&ctx.app);
+    validate_bearer_token(&headers, &secret)?;
+
+    let app_handle = ctx.app.clone();
+    tokio::spawn(async move {
+        if let Err(e) = crate::services::stream_downloader::execute_stream_download(app_handle, body).await {
+            log::error!("http_api: stream download failed: {e}");
+        }
+    });
+
+    Ok(StatusCode::ACCEPTED)
 }
 
 async fn handle_version(State(ctx): State<Arc<ApiContext>>) -> impl IntoResponse {

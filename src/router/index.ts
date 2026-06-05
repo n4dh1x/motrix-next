@@ -19,6 +19,11 @@ const router = createRouter({
           props: true,
         },
         {
+          path: '/stream-dashboard',
+          name: 'stream-dashboard',
+          component: () => import('@/views/StreamDashboard.vue'),
+        },
+        {
           path: '/preference',
           name: 'preference',
           component: () => import('@/views/PreferenceView.vue'),

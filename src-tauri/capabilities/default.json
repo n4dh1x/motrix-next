@@ -42,6 +42,13 @@
     "locale:default",
     "log:default",
     "sql:default",
-    "sql:allow-execute"
+    "sql:allow-execute",
+    {
+      "identifier": "shell:allow-spawn",
+      "allow": [
+        { "name": "binaries/yt-dlp", "sidecar": true },
+        { "name": "binaries/ffmpeg", "sidecar": true }
+      ]
+    }
   ]
 }

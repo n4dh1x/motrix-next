@@ -6,7 +6,7 @@ import { useAppStore } from '@/stores/app'
 
 import { NIcon } from 'naive-ui'
 import MTooltip from '@/components/common/MTooltip.vue'
-import { ListOutline, AddOutline, SettingsOutline, HelpCircleOutline } from '@vicons/ionicons5'
+import { ListOutline, AddOutline, SettingsOutline, HelpCircleOutline, TvOutline } from '@vicons/ionicons5'
 
 const { t } = useI18n()
 const router = useRouter()
@@ -85,6 +85,21 @@ function showAddTask() {
               </button>
             </template>
             {{ t('app.add-task') }}
+          </MTooltip>
+        </li>
+        <li>
+          <MTooltip placement="right">
+            <template #trigger>
+              <button
+                type="button"
+                class="menu-button non-draggable"
+                aria-label="Stream Downloads"
+                @click="nav('/stream-dashboard')"
+              >
+                <NIcon :size="20"><TvOutline /></NIcon>
+              </button>
+            </template>
+            Stream Downloads
           </MTooltip>
         </li>
       </ul>
